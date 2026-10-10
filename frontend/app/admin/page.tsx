@@ -2,6 +2,7 @@
 
 import { useState, useEffect, useMemo } from "react";
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import {
   Calendar,
   Users,
@@ -14,13 +15,15 @@ import {
   Clock,
   Sparkles,
   Bot,
-  User,
+  User as UserIcon,
   Shield,
   Trash2,
   ExternalLink,
   ChevronRight,
   TrendingUp,
+  LogOut,
 } from "lucide-react";
+import { apiFetch, getAuthToken, clearAuthToken, getUserInfo, UserSummary } from "../../lib/api";
 
 interface Appointment {
   id: string;
@@ -37,21 +40,45 @@ interface Appointment {
 }
 
 export default function AdminDashboardPage() {
+  const router = useRouter();
+  const [currentUser, setCurrentUser] = useState<UserSummary | null>(null);
   const [appointments, setAppointments] = useState<Appointment[]>([]);
   const [loading, setLoading] = useState<boolean>(true);
   const [searchQuery, setSearchQuery] = useState<string>("");
   const [filterService, setFilterService] = useState<string>("all");
   const [refreshing, setRefreshing] = useState<boolean>(false);
 
+  useEffect(() => {
+    const token = getAuthToken();
+    if (!token) {
+      router.push("/admin/login");
+      return;
+    }
+    const user = getUserInfo();
+    setCurrentUser(user);
+    fetchAppointments();
+
+    const interval = setInterval(fetchAppointments, 8000);
+    return () => clearInterval(interval);
+  }, []);
+
+  const handleLogout = () => {
+    clearAuthToken();
+    router.push("/admin/login");
+  };
+
   const fetchAppointments = async () => {
     setRefreshing(true);
     try {
-      const res = await fetch("http://localhost:8000/api/appointments");
+      const res = await apiFetch("/api/appointments");
       if (res.ok) {
         const data = await res.json();
         if (Array.isArray(data.appointments)) {
           setAppointments(data.appointments);
         }
+      } else if (res.status === 401) {
+        clearAuthToken();
+        router.push("/admin/login?error=session_expired");
       }
     } catch (err) {
       console.error("Failed to load appointments:", err);
@@ -61,18 +88,16 @@ export default function AdminDashboardPage() {
     }
   };
 
-  useEffect(() => {
-    fetchAppointments();
-    // Auto-refresh every 8 seconds for live dashboard updates
-    const interval = setInterval(fetchAppointments, 8000);
-    return () => clearInterval(interval);
-  }, []);
-
   const clearAllAppointments = async () => {
-    if (confirm("Reset all appointment bookings in Redis?")) {
+    if (confirm("Reset all appointment bookings in Redis? (Superadmin only)")) {
       try {
-        await fetch("http://localhost:8000/api/appointments", { method: "DELETE" });
-        setAppointments([]);
+        const res = await apiFetch("/api/appointments", { method: "DELETE" });
+        if (res.ok) {
+          setAppointments([]);
+        } else {
+          const errData = await res.json().catch(() => null);
+          alert(errData?.detail || "Delete operation not permitted for your role or environment.");
+        }
       } catch (err) {
         console.error("Error clearing:", err);
       }
@@ -148,6 +173,25 @@ export default function AdminDashboardPage() {
               title="Clear all appointments"
             >
               <Trash2 className="h-4 w-4" />
+            </button>
+
+            {currentUser && (
+              <div className="flex items-center gap-2 px-3 py-1.5 rounded-xl bg-slate-900/90 border border-slate-700/80 text-xs">
+                <UserIcon className="h-3.5 w-3.5 text-indigo-400" />
+                <span className="font-medium text-slate-200">{currentUser.full_name}</span>
+                <span className="px-1.5 py-0.5 rounded text-[10px] font-semibold bg-indigo-950 text-indigo-300 border border-indigo-800/60">
+                  {currentUser.role}
+                </span>
+              </div>
+            )}
+
+            <button
+              onClick={handleLogout}
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-slate-900 hover:bg-slate-800 border border-slate-700 text-xs text-rose-300 font-medium transition-colors"
+              title="Sign out"
+            >
+              <LogOut className="h-3.5 w-3.5" />
+              <span>Logout</span>
             </button>
 
             <Link

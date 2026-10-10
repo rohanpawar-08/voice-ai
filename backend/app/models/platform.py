@@ -1,7 +1,7 @@
 import enum
 import uuid
 from datetime import datetime
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 from sqlalchemy import (
     Boolean,
     DateTime,
@@ -90,6 +90,9 @@ class Tenant(Base):
 # ---------------------------------------------------------------------------
 class User(Base):
     __tablename__ = "users"
+    __table_args__ = (
+        Index("ix_users_tenant_email", "tenant_id", "email"),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
     tenant_id: Mapped[uuid.UUID] = mapped_column(
@@ -99,6 +102,8 @@ class User(Base):
     phone: Mapped[str] = mapped_column(String(32), nullable=True, index=True)
     full_name: Mapped[str] = mapped_column(String(255), nullable=False)
     role: Mapped[str] = mapped_column(String(64), default=UserRole.OPERATOR.value, nullable=False)
+    hashed_password: Mapped[str] = mapped_column(String(255), nullable=True)
+    last_login_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 

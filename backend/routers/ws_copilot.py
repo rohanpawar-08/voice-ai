@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import io
 import json
@@ -12,6 +13,7 @@ from langchain_core.messages import BaseMessage, HumanMessage, AIMessage
 from config import settings
 from agent.graph import execute_agent_workflow
 from audio.tts_engine import stream_text_to_audio, select_neural_voice, is_marathi_or_devanagari
+from app.core.security import decode_websocket_ticket
 
 logger = logging.getLogger("copilot.ws")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
@@ -28,6 +30,16 @@ session_audio_mimes: Dict[str, str] = {}
 
 async def get_redis_client() -> aioredis.Redis:
     global redis_client
+    try:
+        current_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        current_loop = None
+
+    if redis_client is not None:
+        client_loop = getattr(redis_client.connection_pool, "_loop", None)
+        if client_loop is not None and client_loop is not current_loop:
+            redis_client = None
+
     if redis_client is None:
         redis_client = aioredis.from_url(
             settings.redis_url,
@@ -38,24 +50,69 @@ async def get_redis_client() -> aioredis.Redis:
     return redis_client
 
 
+@router.websocket("/ws/copilot")
 @router.websocket("/ws/copilot/{session_id}")
-async def websocket_copilot_endpoint(websocket: WebSocket, session_id: str):
+async def websocket_copilot_endpoint(
+    websocket: WebSocket,
+    session_id: Optional[str] = None,
+    ticket: Optional[str] = None,
+):
     """
     Asynchronous WebSocket endpoint for Real-Time Multimodal Voice & Support Copilot.
     Pipeline:
-    1. Session verification & Redis connection ping
-    2. Low-latency ping-pong heartbeat
-    3. Live 16kHz audio chunk streaming from client microphone
-    4. End-of-speech assembly and Whisper STT via Groq
-    5. LangGraph multi-turn LLM reasoning with MCP tool execution
-    6. Streaming Microsoft Edge Neural TTS audio packets (MP3) back to client
-    7. Phase 5: End-to-End Latency Waterfall Telemetry (STT, LLM, TTS, E2E)
-    8. Redis conversational memory retention & state sync
+    1. Origin header verification against allowed CORS origins
+    2. Short-lived signed session ticket verification (cryptographic bind)
+    3. Low-latency ping-pong heartbeat
+    4. Live 16kHz audio chunk streaming from client microphone
+    5. End-of-speech assembly and Whisper STT via Groq
+    6. LangGraph multi-turn LLM reasoning with tenant-scoped tool policy
+    7. Streaming Microsoft Edge Neural TTS audio packets (MP3) back to client
+    8. End-to-End Latency Waterfall Telemetry (STT, LLM, TTS, E2E)
+    9. Tenant-isolated Redis conversational memory retention & state sync
     """
+    # 1. Validate Origin header if present
+    origin = websocket.headers.get("origin")
+    if origin:
+        allowed = [o.rstrip("/") for o in settings.CORS_ALLOWED_ORIGINS]
+        if origin.rstrip("/") not in allowed and origin != "null":
+            logger.warning(f"WebSocket handshake rejected: unauthorized origin '{origin}'")
+            await websocket.close(code=4003, reason="Unauthorized origin")
+            return
+
+    # 2. Extract and validate session ticket
+    ticket_val = ticket or websocket.query_params.get("ticket")
+    if not ticket_val:
+        logger.warning(f"WebSocket handshake rejected: missing session ticket for session {session_id}")
+        await websocket.close(code=4401, reason="Missing session ticket")
+        return
+
+    try:
+        ticket_payload = decode_websocket_ticket(ticket_val)
+    except ValueError as err:
+        logger.warning(f"WebSocket handshake rejected: ticket validation failed ({err})")
+        await websocket.close(code=4401, reason=str(err))
+        return
+
+    ticket_session_id = ticket_payload.get("session_id")
+    if session_id and session_id != ticket_session_id:
+        logger.warning(
+            f"WebSocket handshake rejected: path session_id '{session_id}' != ticket session_id '{ticket_session_id}'"
+        )
+        await websocket.close(code=4401, reason="Mismatched session ID")
+        return
+
+    session_id = ticket_session_id
+    tenant_id = ticket_payload.get("tenant_id")
+    tenant_slug = ticket_payload.get("tenant_slug", "sai-smile")
+    session_type = ticket_payload.get("session_type", "public")
+    allowed_tools = set(ticket_payload.get("allowed_tools", []))
+
     await websocket.accept()
-    logger.info(f"WebSocket client connected with session_id: {session_id}")
+    logger.info(f"WebSocket client connected: session_id={session_id}, tenant={tenant_slug}, type={session_type}")
     session_audio_buffers[session_id] = []
     session_audio_mimes[session_id] = "audio/webm"
+
+    tenant_key_prefix = f"copilot:tenant:{tenant_id}:session:{session_id}"
 
     # Ping Redis and load existing session transcripts & telemetry if available
     redis_status = "unavailable"
@@ -66,14 +123,18 @@ async def websocket_copilot_endpoint(websocket: WebSocket, session_id: str):
         pong = await r.ping()
         if pong:
             redis_status = "connected"
-            await r.set(f"copilot:session:{session_id}:connected_at", str(time.time()), ex=86400)
-            raw_list = await r.lrange(f"copilot:session:{session_id}:transcript", -50, -1)
+            await r.set(f"{tenant_key_prefix}:connected_at", str(time.time()), ex=86400)
+            raw_list = await r.lrange(f"{tenant_key_prefix}:transcript", -50, -1)
+            if len(raw_list) == 0:
+                raw_list = await r.lrange(f"copilot:session:{session_id}:transcript", -50, -1)
             for item in raw_list:
                 try:
                     existing_transcripts.append(json.loads(item))
                 except Exception:
                     pass
-            raw_telem = await r.get(f"copilot:session:{session_id}:last_telemetry")
+            raw_telem = await r.get(f"{tenant_key_prefix}:last_telemetry")
+            if not raw_telem:
+                raw_telem = await r.get(f"copilot:session:{session_id}:last_telemetry")
             if raw_telem:
                 try:
                     last_telemetry = json.loads(raw_telem)
@@ -173,7 +234,9 @@ async def websocket_copilot_endpoint(websocket: WebSocket, session_id: str):
         history_messages: List[BaseMessage] = []
         try:
             r = await get_redis_client()
-            raw_turns = await r.lrange(f"copilot:session:{session_id}:messages", -10, -1)
+            raw_turns = await r.lrange(f"{tenant_key_prefix}:messages", -10, -1)
+            if len(raw_turns) == 0:
+                raw_turns = await r.lrange(f"copilot:session:{session_id}:messages", -10, -1)
             for raw_m in raw_turns:
                 m_data = json.loads(raw_m)
                 if m_data.get("role") == "user":
@@ -193,27 +256,28 @@ async def websocket_copilot_endpoint(websocket: WebSocket, session_id: str):
             except Exception as send_err:
                 logger.error(f"Failed to send agent event to client: {send_err}")
 
-        # 3. Execute LangGraph workflow
+        # 3. Execute LangGraph workflow with scoped allowed_tools
         llm_start = time.perf_counter()
         assistant_reply, tools_used = await execute_agent_workflow(
             messages=history_messages,
             session_id=session_id,
-            emit_event=emit_agent_event
+            emit_event=emit_agent_event,
+            allowed_tools=list(allowed_tools) if allowed_tools else None
         )
         llm_reasoning_ms = round((time.perf_counter() - llm_start) * 1000)
 
-        # 4. Save to Redis conversation memory
+        # 4. Save to Redis conversation memory (tenant-isolated)
         try:
             r = await get_redis_client()
             await r.rpush(
-                f"copilot:session:{session_id}:messages",
+                f"{tenant_key_prefix}:messages",
                 json.dumps({"role": "user", "content": user_text, "timestamp": time.time()}, ensure_ascii=False)
             )
             await r.rpush(
-                f"copilot:session:{session_id}:messages",
+                f"{tenant_key_prefix}:messages",
                 json.dumps({"role": "assistant", "content": assistant_reply, "timestamp": time.time()}, ensure_ascii=False)
             )
-            await r.expire(f"copilot:session:{session_id}:messages", 86400)
+            await r.expire(f"{tenant_key_prefix}:messages", 86400)
 
             assistant_transcript_item = {
                 "id": f"ai_{int(time.time() * 1000)}",
@@ -224,8 +288,8 @@ async def websocket_copilot_endpoint(websocket: WebSocket, session_id: str):
                 "timestamp": time.time(),
                 "model": settings.LLM_MODEL
             }
-            await r.rpush(f"copilot:session:{session_id}:transcript", json.dumps(assistant_transcript_item, ensure_ascii=False))
-            await r.expire(f"copilot:session:{session_id}:transcript", 86400)
+            await r.rpush(f"{tenant_key_prefix}:transcript", json.dumps(assistant_transcript_item, ensure_ascii=False))
+            await r.expire(f"{tenant_key_prefix}:transcript", 86400)
         except Exception as save_err:
             logger.warning(f"Failed to persist conversation turns in Redis: {save_err}")
 
@@ -250,12 +314,12 @@ async def websocket_copilot_endpoint(websocket: WebSocket, session_id: str):
             "timestamp": time.time()
         }
 
-        # Cache telemetry in Redis
+        # Cache telemetry in Redis (tenant-isolated)
         try:
             r = await get_redis_client()
-            await r.set(f"copilot:session:{session_id}:last_telemetry", json.dumps(telemetry_metrics), ex=86400)
-            await r.rpush(f"copilot:session:{session_id}:latencies", json.dumps(telemetry_metrics))
-            await r.ltrim(f"copilot:session:{session_id}:latencies", -50, -1)
+            await r.set(f"{tenant_key_prefix}:last_telemetry", json.dumps(telemetry_metrics), ex=86400)
+            await r.rpush(f"{tenant_key_prefix}:latencies", json.dumps(telemetry_metrics))
+            await r.ltrim(f"{tenant_key_prefix}:latencies", -50, -1)
         except Exception as telem_err:
             logger.warning(f"Failed to store telemetry in Redis: {telem_err}")
 
@@ -298,7 +362,7 @@ async def websocket_copilot_endpoint(websocket: WebSocket, session_id: str):
                 }
                 try:
                     r = await get_redis_client()
-                    await r.set(f"copilot:session:{session_id}:last_ping", str(current_time), ex=3600)
+                    await r.set(f"{tenant_key_prefix}:last_ping", str(current_time), ex=3600)
                 except Exception:
                     pass
                 await websocket.send_json(response_payload)
@@ -468,9 +532,9 @@ async def websocket_copilot_endpoint(websocket: WebSocket, session_id: str):
 
                 try:
                     r = await get_redis_client()
-                    await r.rpush(f"copilot:session:{session_id}:transcript", json.dumps(user_transcript_item, ensure_ascii=False))
-                    await r.expire(f"copilot:session:{session_id}:transcript", 86400)
-                    await r.set(f"copilot:session:{session_id}:last_speech", str(time.time()), ex=86400)
+                    await r.rpush(f"{tenant_key_prefix}:transcript", json.dumps(user_transcript_item, ensure_ascii=False))
+                    await r.expire(f"{tenant_key_prefix}:transcript", 86400)
+                    await r.set(f"{tenant_key_prefix}:last_speech", str(time.time()), ex=86400)
                 except Exception as r_err:
                     logger.warning(f"Failed to cache user transcript in Redis: {r_err}")
 
@@ -503,7 +567,7 @@ async def websocket_copilot_endpoint(websocket: WebSocket, session_id: str):
                     }
                     try:
                         r = await get_redis_client()
-                        await r.rpush(f"copilot:session:{session_id}:transcript", json.dumps(user_transcript_item, ensure_ascii=False))
+                        await r.rpush(f"{tenant_key_prefix}:transcript", json.dumps(user_transcript_item, ensure_ascii=False))
                     except Exception:
                         pass
 
@@ -531,6 +595,11 @@ async def websocket_copilot_endpoint(websocket: WebSocket, session_id: str):
             elif msg_type == "clear_transcripts":
                 try:
                     r = await get_redis_client()
+                    await r.delete(f"{tenant_key_prefix}:transcript")
+                    await r.delete(f"{tenant_key_prefix}:messages")
+                    await r.delete(f"{tenant_key_prefix}:latencies")
+                    await r.delete(f"{tenant_key_prefix}:last_telemetry")
+                    # Clear legacy keys as well
                     await r.delete(f"copilot:session:{session_id}:transcript")
                     await r.delete(f"copilot:session:{session_id}:messages")
                     await r.delete(f"copilot:session:{session_id}:latencies")

@@ -44,6 +44,7 @@ SYSTEM_PROMPT = (
 class CopilotState(TypedDict):
     messages: Annotated[List[BaseMessage], add_messages]
     session_id: str
+    allowed_tools: Optional[List[str]]
 
 
 def get_llm():
@@ -101,21 +102,26 @@ def build_copilot_graph():
         last_message = state["messages"][-1]
         tool_messages = []
         tool_calls = getattr(last_message, "tool_calls", None) or []
+        allowed = set(state.get("allowed_tools") or [])
 
         for tc in tool_calls:
             tool_name = tc.get("name") if isinstance(tc, dict) else getattr(tc, "name", None)
             tool_args = tc.get("args", {}) if isinstance(tc, dict) else getattr(tc, "args", {})
             tool_id = tc.get("id") if isinstance(tc, dict) else getattr(tc, "id", f"call_{int(time.time() * 1000)}")
 
-            tool_fn = TOOL_MAP.get(tool_name)
-            if tool_fn:
-                try:
-                    res = tool_fn.invoke(tool_args)
-                except Exception as e:
-                    logger.error(f"Tool execution failed for '{tool_name}': {e}")
-                    res = json.dumps({"error": f"Tool execution failed: {str(e)}"})
+            if allowed and tool_name not in allowed:
+                logger.warning(f"Tool execution blocked for unauthorized tool '{tool_name}' in session {state.get('session_id')}")
+                res = json.dumps({"error": f"Access denied: Tool '{tool_name}' is not authorized for this session."})
             else:
-                res = json.dumps({"error": f"Tool '{tool_name}' not found."})
+                tool_fn = TOOL_MAP.get(tool_name)
+                if tool_fn:
+                    try:
+                        res = tool_fn.invoke(tool_args)
+                    except Exception as e:
+                        logger.error(f"Tool execution failed for '{tool_name}': {e}")
+                        res = json.dumps({"error": f"Tool execution failed: {str(e)}"})
+                else:
+                    res = json.dumps({"error": f"Tool '{tool_name}' not found."})
 
             tool_messages.append(
                 ToolMessage(
@@ -151,7 +157,8 @@ copilot_graph = build_copilot_graph()
 async def execute_agent_workflow(
     messages: List[BaseMessage],
     session_id: str,
-    emit_event: Optional[Callable[[Dict[str, Any]], Any]] = None
+    emit_event: Optional[Callable[[Dict[str, Any]], Any]] = None,
+    allowed_tools: Optional[List[str]] = None
 ) -> tuple[str, List[Dict[str, Any]]]:
     """
     Executes the LangGraph multi-turn agent workflow for VoiceDesk AI clinic receptionist.
@@ -179,7 +186,11 @@ async def execute_agent_workflow(
             })
         return demo_text, []
 
-    current_state = {"messages": messages, "session_id": session_id}
+    current_state = {
+        "messages": messages,
+        "session_id": session_id,
+        "allowed_tools": allowed_tools
+    }
     final_text = ""
 
     try:

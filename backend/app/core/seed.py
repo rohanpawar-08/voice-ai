@@ -16,6 +16,8 @@ from app.models.platform import (
     RiskLevel,
 )
 from app.adapters.healthcare import HealthcareAdapter
+from app.core.security import hash_password
+from config import settings
 
 logger = logging.getLogger("voicedesk.seed")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
@@ -69,6 +71,8 @@ async def seed_initial_data() -> Dict[str, Any]:
             res = await session.execute(stmt)
             user = res.scalar_one_or_none()
 
+            pwd_hash = hash_password(settings.DEV_SEED_ADMIN_PASSWORD)
+
             if user is None:
                 user = User(
                     id=SAI_SMILE_USER_ID,
@@ -77,13 +81,15 @@ async def seed_initial_data() -> Dict[str, Any]:
                     phone="+91 98220 12345",
                     full_name="डॉ. स्नेहा पाटील (Dr. Sneha Patil - Clinic Director)",
                     role=UserRole.TENANT_OWNER.value,
+                    hashed_password=pwd_hash,
                     is_active=True,
                 )
                 session.add(user)
                 await session.flush()
                 logger.info(f"Created User: {user.full_name} ({user.role})")
             else:
-                logger.info(f"User already exists: {user.full_name} ({user.email})")
+                user.hashed_password = pwd_hash
+                logger.info(f"User already exists: {user.full_name} ({user.email}), updated password hash")
             results["user"] = str(user.id)
 
             # 3. Seed Tool Definitions from HealthcareAdapter

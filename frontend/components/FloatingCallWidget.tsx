@@ -114,11 +114,32 @@ export default function FloatingCallWidget({ wsUrl = "ws://localhost:8000" }: Fl
     }
   }, []);
 
-  // WebSocket connection handler
-  const connectWebSocket = useCallback(() => {
-    if (!sessionId) return;
-    const target = `${wsUrl.replace(/\/$/, "")}/ws/copilot/${sessionId}`;
-    const ws = new WebSocket(target);
+  // WebSocket connection handler with signed session ticket
+  const connectWebSocket = useCallback(async () => {
+    try {
+      const httpBase = wsUrl.replace(/^ws/, "http").replace(/\/$/, "");
+      const ticketRes = await fetch(`${httpBase}/api/v1/widget/session`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          tenant_slug: "sai-smile",
+          language: selectedLang === "auto" ? "mr" : selectedLang,
+        }),
+      });
+
+      let currentSess = sessionId;
+      let ticketParam = "";
+      if (ticketRes.ok) {
+        const ticketData = await ticketRes.json();
+        currentSess = ticketData.session_id;
+        ticketParam = `?ticket=${encodeURIComponent(ticketData.ticket)}`;
+        setSessionId(currentSess);
+      } else {
+        console.warn("Failed to acquire signed widget ticket:", ticketRes.status);
+      }
+
+      const target = `${wsUrl.replace(/\/$/, "")}/ws/copilot/${currentSess}${ticketParam}`;
+      const ws = new WebSocket(target);
 
     ws.onmessage = (event) => {
       try {
@@ -203,7 +224,10 @@ export default function FloatingCallWidget({ wsUrl = "ws://localhost:8000" }: Fl
     };
 
     wsRef.current = ws;
-  }, [sessionId, wsUrl, autoSpeak, playTTSAudio]);
+  } catch (err) {
+    console.error("WebSocket connection error:", err);
+  }
+}, [sessionId, wsUrl, autoSpeak, playTTSAudio, selectedLang]);
 
   const startMicRecording = useCallback(async () => {
     if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;

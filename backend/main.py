@@ -6,8 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 import redis.asyncio as aioredis
 
 from config import settings
-from routers import ws_copilot, actions_dev
-from agent.tools import get_all_appointments
+from routers import ws_copilot, auth, voice_sessions, actions, appointments
 from app.core.database import check_db_health
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
@@ -49,7 +48,7 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# CORS middleware for Next.js frontend communication
+# CORS middleware with strict allowed origins
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.CORS_ORIGINS,
@@ -58,9 +57,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Include routers
+# Include secured routers
 app.include_router(ws_copilot.router)
-app.include_router(actions_dev.router)
+app.include_router(auth.router)
+app.include_router(voice_sessions.router)
+app.include_router(actions.router)
+app.include_router(appointments.router)
 
 
 @app.get("/")
@@ -70,7 +72,9 @@ async def root():
         "service": "VoiceDesk AI - Multilingual Voice Action Engine",
         "version": settings.VERSION,
         "active_adapter": "healthcare (Sai Smile Dental Clinic)",
-        "websocket_endpoint": "/ws/copilot/{session_id}",
+        "websocket_endpoint": "/ws/copilot/{session_id}?ticket={ticket}",
+        "auth_api": "/api/v1/auth/login",
+        "widget_session_api": "/api/v1/widget/session",
         "admin_api": "/api/appointments"
     }
 
@@ -108,35 +112,7 @@ async def health_check():
     }
 
 
-# =========================================================================
-# CLINIC ADMIN REST APIS
-# =========================================================================
-
-@app.get("/api/appointments")
-async def get_clinic_appointments():
-    """
-    Returns list of all booked clinic appointments from Redis/memory
-    for the Business Admin Panel.
-    """
-    appointments = get_all_appointments()
-    return {
-        "status": "success",
-        "total": len(appointments),
-        "appointments": appointments
-    }
-
-
-@app.delete("/api/appointments")
-async def clear_clinic_appointments():
-    """Clears all booked appointments from Redis for reset/testing."""
-    try:
-        r = await ws_copilot.get_redis_client()
-        await r.delete("clinic:appointments")
-        return {"status": "success", "message": "Cleared clinic appointments from Redis"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host=settings.HOST, port=settings.PORT, reload=True)
+

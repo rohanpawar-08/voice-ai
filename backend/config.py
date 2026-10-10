@@ -36,28 +36,48 @@ class Settings(BaseSettings):
     TTS_VOICE_MR: str = "mr-IN-AarohiNeural"
     TTS_VOICE_MR_MALE: str = "mr-IN-ManoharNeural"
 
-    # Allowed CORS Origins
+    # Environment
+    ENVIRONMENT: str = "development"
+
+    # Authentication & JWT configuration
+    JWT_SECRET_KEY: str = "voicedesk-dev-jwt-secret-key-32-chars-long-min!"
+    JWT_ALGORITHM: str = "HS256"
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = 15
+    WS_TICKET_EXPIRE_SECONDS: int = 300
+    DEV_SEED_ADMIN_PASSWORD: str = "Admin@1234"
+
+    # Allowed CORS Origins (strictly explicit origins; no wildcard in production)
+    CORS_ALLOWED_ORIGINS: List[str] = [
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "http://localhost:8000",
+    ]
     CORS_ORIGINS: List[str] = [
         "http://localhost:3000",
         "http://127.0.0.1:3000",
         "http://localhost:8000",
-        "*"
     ]
 
-    @field_validator("CORS_ORIGINS", mode="before")
+    @field_validator("CORS_ORIGINS", "CORS_ALLOWED_ORIGINS", mode="before")
     @classmethod
     def assemble_cors_origins(cls, v: Union[str, List[str]]) -> List[str]:
+        origins = []
         if isinstance(v, str):
             if v.startswith("[") and v.endswith("]"):
                 import json
                 try:
-                    return json.loads(v)
+                    origins = json.loads(v)
                 except Exception:
-                    pass
-            return [i.strip() for i in v.split(",") if i.strip()]
+                    origins = [i.strip() for i in v.split(",") if i.strip()]
+            else:
+                origins = [i.strip() for i in v.split(",") if i.strip()]
         elif isinstance(v, list):
-            return v
-        return ["*"]
+            origins = v
+        else:
+            origins = ["http://localhost:3000", "http://127.0.0.1:3000"]
+
+        # Disallow wildcard '*' in origins for security
+        return [o for o in origins if o != "*"]
 
     @property
     def redis_url(self) -> str:
